@@ -123,6 +123,8 @@ struct babel_config {
 
   struct channel_config *ip4_channel;
   struct channel_config *ip6_channel;
+
+  const struct filter *in_filter, *out_filter;
 };
 
 struct babel_iface_config {
