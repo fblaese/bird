@@ -1367,18 +1367,23 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
     rta *old_attrs = NULL;
     rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
     int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
+    rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
     if (fr > F_ACCEPT) {
       /* result is reject */
-        //rte_trace_in(D_FILTERS, c, new, "filtered out");
+      /* TODO: keep filtered */
+      //rte_trace_in(D_FILTERS, c, new, "filtered out");
       // if (!c->in_keep_filtered) {
       //       rta_free(old_attrs);
       //       goto drop;
       //   }
       //new->flags |= REF_FILTERED;
+      /* TODO: remove route, if currently installed */
+      /* currently times out -> unreachable -> uninstalled */
+      return;
+    } else {
+      babel_convert_from_rte(r, rteeeee, &metric);
     }
-    rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
   }
-  babel_convert_from_rte(r, rteeeee, &metric);
 
   fprintf(stderr, "metric result: %d\n", metric);
 
