@@ -1206,7 +1206,11 @@ babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, i
         fprintf(stderr, "routerid: %ld\n", rte->u.babel.router_id);
         rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
 
-/* TODO: where is src,dest prefix stored? */
+        /* TODO: memory leak! malloc alternative */
+        net *nn = malloc(sizeof(net) + r->e->n.addr->length);
+        memset(nn, 0, sizeof(net) + r->e->n.addr->length);
+        net_copy(nn->n.addr, r->e->n.addr);
+        rte->net = nn;
 
         return rte;
 }
@@ -1222,6 +1226,7 @@ babel_convert_from_rte(struct babel_route *babel_route, rte * rte, int * metric)
         *metric = rte->u.babel.metric;
 
         /* free up temporary rte and attributes allocated in convert_to_rte() */
+        free(rte->net);
         rte_free(rte);
         rte = NULL;
 
@@ -1356,6 +1361,7 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
   if (filter == FILTER_REJECT) {
     /* reject route */
   } else if (filter) {
+    /* fbl-todo: memory leak */
     pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
     linpool *rte_update_pool = lp_new_default(rt_table_pool);
     rta *old_attrs = NULL;
