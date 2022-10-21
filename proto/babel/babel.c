@@ -66,6 +66,81 @@ static inline void babel_iface_kick_timer(struct babel_iface *ifa);
  *	Functions to maintain data structures
  */
 
+/**
+ * Allocate a new rte struct and write appropriate values for filtering
+ * into it
+ */
+rte *
+babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, int seqno, u64 router_id) {
+        rta a0 = {
+                .src = p->p.main_source,
+                .source = RTS_BABEL,
+                .scope = SCOPE_UNIVERSE,
+                .dest = RTD_UNICAST,
+                .from = r->neigh->addr,
+                .nh.gw = r->next_hop,
+                .nh.iface = r->neigh->ifa->iface,
+        };
+
+        /* be careful: operating on global rta cache! */
+        rta *a = rta_lookup(&a0);
+        rte *rte = rte_get_temp(a);
+
+        rte->u.babel.seqno = seqno;
+        rte->u.babel.metric = metric;
+        rte->u.babel.router_id = router_id;
+        rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
+
+        /* TODO: memory leak! malloc alternative */
+        net *nn = malloc(sizeof(net) + r->e->n.addr->length);
+        memset(nn, 0, sizeof(net) + r->e->n.addr->length);
+        net_copy(nn->n.addr, r->e->n.addr);
+        rte->net = nn;
+
+        return rte;
+}
+
+/**
+ * Read values from rte_route into babel_route.
+ */
+void
+babel_convert_from_rte(struct babel_route *babel_route, rte * rte, int * metric) {
+        /* write back metric after filtering */
+        // incremented by 41/42 for debugging purposes
+        //*metric = *metric < rte->u.babel.metric ? rte->u.babel.metric + 42 : *metric + 41;
+        *metric = rte->u.babel.metric;
+
+        /* free up temporary rte and attributes allocated in convert_to_rte() */
+        free(rte->net);
+        rte_free(rte);
+        rte = NULL;
+
+        return;
+}
+
+static void
+rte_store_tmp_attrs(rte *r, linpool *lp, rta *old_attrs)
+{
+  void (*store_tmp_attrs)(rte *rt, linpool *lp);
+  store_tmp_attrs = r->attrs->src->proto->store_tmp_attrs;
+
+  if (!store_tmp_attrs)
+    return;
+
+  ASSERT(!rta_is_cached(r->attrs));
+
+  /* If there is no new ea_list, we just skip the temporary ea_list */
+  ea_list *ea = r->attrs->eattrs;
+  if (ea && (ea->flags & EALF_TEMP))
+    r->attrs->eattrs = ea->next;
+  else
+    store_tmp_attrs(r, lp);
+
+  /* Free ref we got in rte_make_tmp_attrs(), have to do rta_lookup() first */
+  r->attrs = rta_lookup(r->attrs);
+  rta_free(old_attrs);
+}
+
 static void
 babel_init_entry(struct fib *f UNUSED, void *E)
 {
@@ -942,6 +1017,8 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
 
   FIB_WALK(rtable, struct babel_entry, e)
   {
+    int metric = e->metric;
+
     if (!e->valid)
       continue;
 
@@ -953,18 +1030,60 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
       e->updated = current_time();
     }
 
+    if (e->selected) {
+      rte * rteeeee = babel_convert_to_rte(p, e->selected, e->metric, e->seqno, e->router_id);
+      struct babel_config *cf = (void *) p->p.cf;
+      const struct filter * filter = cf->out_filter;
+      if (filter == FILTER_REJECT) {
+        /* reject route */
+      } else if (filter) {
+        /* fbl-todo: memory leak */
+        pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
+        linpool *rte_update_pool = lp_new_default(rt_table_pool);
+        rta *old_attrs = NULL;
+        rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
+        int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
+        rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
+        if (fr > F_ACCEPT) {
+          /* result is reject */
+          /* TODO: keep filtered */
+          //rte_trace_in(D_FILTERS, c, new, "filtered out");
+          // if (!c->in_keep_filtered) {
+          //       rta_free(old_attrs);
+          //       goto drop;
+          //   }
+          //new->flags |= REF_FILTERED;
+          /* TODO: remove route, if currently installed */
+          /* currently times out -> unreachable -> uninstalled */
+          return;
+        } else {
+          babel_convert_from_rte(e->selected, rteeeee, &metric);
+        }
+      }
+    } else {
+      /* if no route is selected, it is possible that we announce this route ourselves */
+      log(L_ERR "no route selected! nothing to filter. metric: %d\n", e->metric);
+      log(L_ERR "route: %N\n", e->n.addr);
+      struct babel_entry *n;
+      size_t list_size = 0;
+      WALK_LIST(n, e->routes) {
+        list_size++;
+      }
+      log(L_ERR "list size: %lu", list_size);
+    }
+
     /* Skip routes that weren't updated since 'changed' time */
     if (e->updated < changed)
       continue;
 
     TRACE(D_PACKETS, "Sending update for %N router-id %lR seqno %d metric %d",
-	  e->n.addr, e->router_id, e->seqno, e->metric);
+	  e->n.addr, e->router_id, e->seqno, metric);
 
     union babel_msg msg = {};
     msg.type = BABEL_TLV_UPDATE;
     msg.update.interval = ifa->cf->update_interval;
     msg.update.seqno = e->seqno;
-    msg.update.metric = e->metric;
+    msg.update.metric = metric;
     msg.update.router_id = e->router_id;
     net_copy(&msg.update.net, e->n.addr);
 
@@ -1179,84 +1298,6 @@ babel_handle_ihu(union babel_msg *m, struct babel_iface *ifa)
 }
 
 /**
- * Allocate a new rte struct and write appropriate values for filtering
- * into it
- */
-rte *
-babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, int seqno, u64 router_id) {
-        rta a0 = {
-                .src = p->p.main_source,
-                .source = RTS_BABEL,
-                .scope = SCOPE_UNIVERSE,
-                .dest = RTD_UNICAST,
-                .from = r->neigh->addr,
-                .nh.gw = r->next_hop,
-                .nh.iface = r->neigh->ifa->iface,
-        };
-
-        /* be careful: operating on global rta cache! */
-        rta *a = rta_lookup(&a0);
-        rte *rte = rte_get_temp(a);
-
-        rte->u.babel.seqno = seqno;
-        fprintf(stderr, "seqno: %d\n", rte->u.babel.seqno);
-        rte->u.babel.metric = metric;
-        fprintf(stderr, "metric: %d\n", rte->u.babel.metric);
-        rte->u.babel.router_id = router_id;
-        fprintf(stderr, "routerid: %ld\n", rte->u.babel.router_id);
-        rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
-
-        /* TODO: memory leak! malloc alternative */
-        net *nn = malloc(sizeof(net) + r->e->n.addr->length);
-        memset(nn, 0, sizeof(net) + r->e->n.addr->length);
-        net_copy(nn->n.addr, r->e->n.addr);
-        rte->net = nn;
-
-        return rte;
-}
-
-/**
- * Read values from rte_route into babel_route.
- */
-void
-babel_convert_from_rte(struct babel_route *babel_route, rte * rte, int * metric) {
-        /* write back metric after filtering */
-        // incremented by 41/42 for debugging purposes
-        //*metric = *metric < rte->u.babel.metric ? rte->u.babel.metric + 42 : *metric + 41;
-        *metric = rte->u.babel.metric;
-
-        /* free up temporary rte and attributes allocated in convert_to_rte() */
-        free(rte->net);
-        rte_free(rte);
-        rte = NULL;
-
-        return;
-}
-
-static void
-rte_store_tmp_attrs(rte *r, linpool *lp, rta *old_attrs)
-{
-  void (*store_tmp_attrs)(rte *rt, linpool *lp);
-  store_tmp_attrs = r->attrs->src->proto->store_tmp_attrs;
-
-  if (!store_tmp_attrs)
-    return;
-
-  ASSERT(!rta_is_cached(r->attrs));
-
-  /* If there is no new ea_list, we just skip the temporary ea_list */
-  ea_list *ea = r->attrs->eattrs;
-  if (ea && (ea->flags & EALF_TEMP))
-    r->attrs->eattrs = ea->next;
-  else
-    store_tmp_attrs(r, lp);
-
-  /* Free ref we got in rte_make_tmp_attrs(), have to do rta_lookup() first */
-  r->attrs = rta_lookup(r->attrs);
-  rta_free(old_attrs);
-}
-
-/**
  * babel_handle_update - handle incoming route updates
  * @m: Incoming update TLV
  * @ifa: Interface the update was received on
@@ -1357,7 +1398,6 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
   /* fbl: do filtering */
   struct babel_config *cf = (void *) p->p.cf;
   const struct filter * filter = cf->in_filter;
-  fprintf(stderr, "filter: %p\n", filter);
   if (filter == FILTER_REJECT) {
     /* reject route */
   } else if (filter) {
@@ -1384,8 +1424,6 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
       babel_convert_from_rte(r, rteeeee, &metric);
     }
   }
-
-  fprintf(stderr, "metric result: %d\n", metric);
 
   /* RFC section 3.8.2.2 - Dealing with unfeasible updates */
   if (!feasible && (metric != BABEL_INFINITY) &&
