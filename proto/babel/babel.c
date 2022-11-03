@@ -72,14 +72,25 @@ static inline void babel_iface_kick_timer(struct babel_iface *ifa);
  */
 rte *
 babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, int seqno, u64 router_id) {
+        struct ip6_addr from = {};
+        struct ip6_addr nh_gw = {};
+        struct iface *nh_iface = NULL;
+
+        if (r) {
+          /* fbl-todo: is it acutally feasible to omit the assignments below for self-announced routes? */
+          from = r->neigh->addr;
+          nh_gw = r->next_hop;
+          nh_iface = r->neigh->ifa->iface;
+        }
+
         rta a0 = {
                 .src = p->p.main_source,
                 .source = RTS_BABEL,
                 .scope = SCOPE_UNIVERSE,
                 .dest = RTD_UNICAST,
-                .from = r->neigh->addr,
-                .nh.gw = r->next_hop,
-                .nh.iface = r->neigh->ifa->iface,
+                .from = from,
+                .nh.gw = nh_gw,
+                .nh.iface = nh_iface,
         };
 
         /* be careful: operating on global rta cache! */
@@ -92,10 +103,15 @@ babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, i
         rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
 
         /* TODO: memory leak! malloc alternative */
-        net *nn = malloc(sizeof(net) + r->e->n.addr->length);
-        memset(nn, 0, sizeof(net) + r->e->n.addr->length);
-        net_copy(nn->n.addr, r->e->n.addr);
-        rte->net = nn;
+        if (r) {
+          /* fbl-todo: is it acutally feasible to omit the assignments below for self-announced routes? */
+          net *nn = malloc(sizeof(net) + r->e->n.addr->length);
+          memset(nn, 0, sizeof(net) + r->e->n.addr->length);
+          net_copy(nn->n.addr, r->e->n.addr);
+          rte->net = nn;
+        } else {
+          rte->net = NULL;
+        }
 
         return rte;
 }
@@ -1030,49 +1046,38 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
       e->updated = current_time();
     }
 
-    if (e->selected) {
-      rte * rteeeee = babel_convert_to_rte(p, e->selected, e->metric, e->seqno, e->router_id);
-      struct babel_config *cf = (void *) p->p.cf;
-      const struct filter * filter = cf->out_filter;
-      if (filter == FILTER_REJECT) {
-        /* reject route */
-      } else if (filter) {
-        /* fbl-todo: memory leak */
-        pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
-        linpool *rte_update_pool = lp_new_default(rt_table_pool);
-        rta *old_attrs = NULL;
-        rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
-        int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
-        rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
-        if (fr > F_ACCEPT) {
-          /* result is reject */
-          /* TODO: keep filtered */
-          //rte_trace_in(D_FILTERS, c, new, "filtered out");
-          // if (!c->in_keep_filtered) {
-          //       rta_free(old_attrs);
-          //       goto drop;
-          //   }
-          //new->flags |= REF_FILTERED;
-          /* TODO: remove route, if currently installed */
-          /* currently times out -> unreachable -> uninstalled */
-          return;
-        } else {
-          babel_convert_from_rte(e->selected, rteeeee, &metric);
-        }
+    rte * rteeeee = babel_convert_to_rte(p, e->selected, metric, e->seqno, e->router_id);
+    struct babel_config *cf = (void *) p->p.cf;
+    const struct filter * filter = cf->out_filter;
+    if (filter == FILTER_REJECT) {
+      /* reject route */
+    } else if (filter) {
+      /* fbl-todo: memory leak */
+      pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
+      linpool *rte_update_pool = lp_new_default(rt_table_pool);
+      rta *old_attrs = NULL;
+      rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
+      int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
+      rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
+      if (fr > F_ACCEPT) {
+        /* result is reject */
+        /* TODO: keep filtered */
+        //rte_trace_in(D_FILTERS, c, new, "filtered out");
+        // if (!c->in_keep_filtered) {
+        //       rta_free(old_attrs);
+        //       goto drop;
+        //   }
+        //new->flags |= REF_FILTERED;
+        /* TODO: remove route, if currently installed */
+        /* currently times out -> unreachable -> uninstalled */
+        return;
+      } else {
+        babel_convert_from_rte(e->selected, rteeeee, &metric);
       }
-    } else {
-      /* if no route is selected, it is possible that we announce this route ourselves */
-      log(L_ERR "no route selected! nothing to filter. metric: %d\n", e->metric);
-      log(L_ERR "route: %N\n", e->n.addr);
-      struct babel_entry *n;
-      size_t list_size = 0;
-      WALK_LIST(n, e->routes) {
-        list_size++;
-      }
-      log(L_ERR "list size: %lu", list_size);
     }
 
     /* Skip routes that weren't updated since 'changed' time */
+    /* fbl-todo: update routes on filter? what happens on config reload? */
     if (e->updated < changed)
       continue;
 
