@@ -1046,7 +1046,7 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
       e->updated = current_time();
     }
 
-    rte * rteeeee = babel_convert_to_rte(p, e->selected, metric, e->seqno, e->router_id);
+    rte * rte = babel_convert_to_rte(p, e->selected, metric, e->seqno, e->router_id);
     struct babel_config *cf = (void *) p->p.cf;
     const struct filter * filter = cf->out_filter;
     if (filter == FILTER_REJECT) {
@@ -1056,23 +1056,16 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
       pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
       linpool *rte_update_pool = lp_new_default(rt_table_pool);
       rta *old_attrs = NULL;
-      rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
-      int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
-      rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
+      rte_make_tmp_attrs(&rte, rte_update_pool, &old_attrs);
+      int fr = f_run(filter, &rte, rte_update_pool, 0);
+      rte_store_tmp_attrs(rte, rte_update_pool, old_attrs);
       if (fr > F_ACCEPT) {
         /* result is reject */
-        /* TODO: keep filtered */
-        //rte_trace_in(D_FILTERS, c, new, "filtered out");
-        // if (!c->in_keep_filtered) {
-        //       rta_free(old_attrs);
-        //       goto drop;
-        //   }
-        //new->flags |= REF_FILTERED;
-        /* TODO: remove route, if currently installed */
-        /* currently times out -> unreachable -> uninstalled */
+        /* fbl-todo: implement keep filtered? requires an interface for investigating routes.. */
+        /* fbl-todo: explicitly remove route, if currently installed? or await timeout -> unreachable -> uninstall? */
         return;
       } else {
-        babel_convert_from_rte(e->selected, rteeeee, &metric);
+        babel_convert_from_rte(e->selected, rte, &metric);
       }
     }
 
@@ -1399,7 +1392,7 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
   /* fbl-todo: this is the currently selected route (might be a different neighbor) */
   best = e->selected;
 
-  rte * rteeeee = babel_convert_to_rte(p, r, metric, msg->seqno, msg->router_id);
+  rte * rte = babel_convert_to_rte(p, r, metric, msg->seqno, msg->router_id);
   /* fbl: do filtering */
   struct babel_config *cf = (void *) p->p.cf;
   const struct filter * filter = cf->in_filter;
@@ -1410,9 +1403,9 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
     pool *rt_table_pool = rp_new(&root_pool, "Routing tables");
     linpool *rte_update_pool = lp_new_default(rt_table_pool);
     rta *old_attrs = NULL;
-    rte_make_tmp_attrs(&rteeeee, rte_update_pool, &old_attrs);
-    int fr = f_run(filter, &rteeeee, rte_update_pool, 0);
-    rte_store_tmp_attrs(rteeeee, rte_update_pool, old_attrs);
+    rte_make_tmp_attrs(&rte, rte_update_pool, &old_attrs);
+    int fr = f_run(filter, &rte, rte_update_pool, 0);
+    rte_store_tmp_attrs(rte, rte_update_pool, old_attrs);
     if (fr > F_ACCEPT) {
       /* result is reject */
       /* TODO: keep filtered */
@@ -1426,7 +1419,7 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
       /* currently times out -> unreachable -> uninstalled */
       return;
     } else {
-      babel_convert_from_rte(r, rteeeee, &metric);
+      babel_convert_from_rte(r, rte, &metric);
     }
   }
 
