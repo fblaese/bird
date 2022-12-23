@@ -632,9 +632,8 @@ done:
  * the entry is valid and ours, the unreachable route is announced instead.
  */
 static void
-babel_announce_rte(struct babel_proto *p, struct babel_entry *e)
+babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_route *r)
 {
-  struct babel_route *r = e->selected;
   struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
 
   if (r)
@@ -657,6 +656,13 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e)
     if (!neigh_find(&p->p, r->next_hop, r->neigh->ifa->iface, 0))
       a0.nh.flags = RNF_ONLINK;
 
+    struct rte_src *src;
+    u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
+    src = rt_get_source(&p->p, path_id);
+    a0.src = src;
+    log(L_ERR "announce rte to nest for babel route %N: path-id %R metric %I",
+        e->n.addr, path_id, a0.nh.gw);
+
     rta *a = rta_lookup(&a0);
     rte *rte = rte_get_temp(a);
     rte->u.babel.seqno = r->seqno;
@@ -665,10 +671,11 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e)
     rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
 
     e->unreachable = 0;
-    rte_update2(c, e->n.addr, rte, p->p.main_source);
+    rte_update2(c, e->n.addr, rte, a0.src);
   }
   else if (e->valid && (e->router_id != p->router_id))
   {
+    // fbl-todo: unreachable code
     /* Unreachable */
     rta a0 = {
       .src = p->p.main_source,
@@ -688,6 +695,7 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e)
   }
   else
   {
+    // fbl-todo: unreachable code
     /* Retraction */
     e->unreachable = 0;
     rte_update2(c, e->n.addr, NULL, p->p.main_source);
@@ -737,6 +745,10 @@ babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_ro
 {
   struct babel_route *r, *best = e->selected;
 
+  /* fbl-todo: always announce routes staged for selection (updated!) to core, so selection 
+     can be made in next */
+  babel_announce_rte(p, e, mod);
+
   /* Shortcut if only non-best was modified */
   if (mod && (mod != best))
   {
@@ -780,7 +792,6 @@ babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_ro
     return;
 
   e->selected = best;
-  babel_announce_rte(p, e);
 }
 
 /*
@@ -2319,6 +2330,12 @@ babel_rt_notify(struct proto *P, struct channel *c UNUSED, struct network *net,
   }
 }
 
+
+/**
+ * babel_rte_better - Callback for route selection in nest
+ * @new: Staged route entry
+ * @old: Previous route entry
+ */
 static int
 babel_rte_better(struct rte *new, struct rte *old)
 {
