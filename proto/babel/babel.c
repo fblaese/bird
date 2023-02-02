@@ -51,7 +51,7 @@ static inline int ge_mod64k(uint a, uint b)
 
 static void babel_expire_requests(struct babel_proto *p, struct babel_entry *e);
 static void babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_route *mod);
-static inline void babel_announce_retraction(struct babel_proto *p, struct babel_entry *e);
+static inline void babel_announce_retraction(struct babel_proto *p, struct babel_route *r);
 static void babel_send_route_request(struct babel_proto *p, struct babel_entry *e, struct babel_neighbor *n);
 static void babel_send_seqno_request(struct babel_proto *p, struct babel_entry *e, struct babel_seqno_request *sr);
 static void babel_update_cost(struct babel_neighbor *n);
@@ -179,6 +179,8 @@ babel_flush_route(struct babel_proto *p, struct babel_route *r)
   DBG("Babel: Flush route %N router_id %lR neigh %I\n",
       r->e->n.addr, r->router_id, r->neigh->addr);
 
+  babel_announce_retraction(p, r);
+
   rem_node(NODE r);
   rem_node(&r->neigh_route);
 
@@ -263,7 +265,6 @@ loop:
     if (e->unreachable && (!e->valid || (e->router_id == p->router_id)))
     {
       FIB_ITERATE_PUT(&fit);
-      babel_announce_retraction(p, e);
       goto loop;
     }
 
@@ -636,82 +637,61 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_ro
 {
   struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
 
-  if (r)
-  {
-    rta a0 = {
-      .src = p->p.main_source,
-      .source = RTS_BABEL,
-      .scope = SCOPE_UNIVERSE,
-      .dest = RTD_UNICAST,
-      .from = r->neigh->addr,
-      .nh.gw = r->next_hop,
-      .nh.iface = r->neigh->ifa->iface,
-    };
+  rta a0 = {
+  .src = p->p.main_source,
+  .source = RTS_BABEL,
+  .scope = SCOPE_UNIVERSE,
+  .dest = RTD_UNICAST,
+  .from = r->neigh->addr,
+  .nh.gw = r->next_hop,
+  .nh.iface = r->neigh->ifa->iface,
+  };
 
-    /*
-     * If we cannot find a reachable neighbour, set the entry to be onlink. This
-     * makes it possible to, e.g., assign /32 addresses on a mesh interface and
-     * have routing work.
-     */
-    if (!neigh_find(&p->p, r->next_hop, r->neigh->ifa->iface, 0))
-      a0.nh.flags = RNF_ONLINK;
+  /*
+    * If we cannot find a reachable neighbour, set the entry to be onlink. This
+    * makes it possible to, e.g., assign /32 addresses on a mesh interface and
+    * have routing work.
+    */
+  if (!neigh_find(&p->p, r->next_hop, r->neigh->ifa->iface, 0))
+    a0.nh.flags = RNF_ONLINK;
 
-    struct rte_src *src;
-    u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
-    src = rt_get_source(&p->p, path_id);
-    a0.src = src;
-    log(L_ERR "announce rte to nest for babel route %N: path-id %R metric %I",
-        e->n.addr, path_id, a0.nh.gw);
+  struct rte_src *src;
+  u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
+  src = rt_get_source(&p->p, path_id);
+  a0.src = src;
+  log(L_ERR "announce rte to nest for babel route %N: path-id %R metric %I",
+    e->n.addr, path_id, a0.nh.gw);
 
-    rta *a = rta_lookup(&a0);
-    rte *rte = rte_get_temp(a);
-    rte->u.babel.seqno = r->seqno;
-    rte->u.babel.metric = r->metric;
-    rte->u.babel.router_id = r->router_id;
-    rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
+  rta *a = rta_lookup(&a0);
+  rte *rte = rte_get_temp(a);
+  rte->u.babel.seqno = r->seqno;
+  rte->u.babel.metric = r->metric;
+  rte->u.babel.router_id = r->router_id;
+  rte->pflags = EA_ID_FLAG(EA_BABEL_METRIC) | EA_ID_FLAG(EA_BABEL_ROUTER_ID);
 
-    e->unreachable = 0;
-    rte_update2(c, e->n.addr, rte, a0.src);
-  }
-  else if (e->valid && (e->router_id != p->router_id))
-  {
-    // fbl-todo: unreachable code
-    /* Unreachable */
-    rta a0 = {
-      .src = p->p.main_source,
-      .source = RTS_BABEL,
-      .scope = SCOPE_UNIVERSE,
-      .dest = RTD_UNREACHABLE,
-    };
-
-    rta *a = rta_lookup(&a0);
-    rte *rte = rte_get_temp(a);
-    memset(&rte->u.babel, 0, sizeof(rte->u.babel));
-    rte->pflags = 0;
-    rte->pref = 1;
-
-    e->unreachable = 1;
-    rte_update2(c, e->n.addr, rte, p->p.main_source);
-  }
-  else
-  {
-    // fbl-todo: unreachable code
-    /* Retraction */
-    e->unreachable = 0;
-    rte_update2(c, e->n.addr, NULL, p->p.main_source);
-  }
+  e->unreachable = 0;
+  rte_update2(c, e->n.addr, rte, a0.src);
 }
 
 /* Special case of babel_announce_rte() just for retraction */
 static inline void
-babel_announce_retraction(struct babel_proto *p, struct babel_entry *e)
+babel_announce_retraction(struct babel_proto *p, struct babel_route *r)
 {
-  struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
-  e->unreachable = 0;
-  rte_update2(c, e->n.addr, NULL, p->p.main_source);
+  struct channel *c = (r->e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
+  r->e->unreachable = 0;
+
+  struct rte_src *src;
+  u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
+  src = rt_get_source(&p->p, path_id);
+  log(L_ERR "retract rte from nest for babel route %N: path-id %R",
+      r->e->n.addr, path_id);
+
+  rte_update2(c, r->e->n.addr, NULL, src);
 }
 
 
+// fbl-todo: code path for re-announcing babel routes broke, because babel_select_route is exited early.
+// best route selection now happens in nest, so re-announce mechanism has to be adjusted accordingly!
 /**
  * babel_select_route - select best route for given route entry
  * @p: Babel protocol instance
@@ -745,8 +725,8 @@ babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_ro
 {
   struct babel_route *r, *best = e->selected;
 
-  /* fbl-todo: always announce routes staged for selection (updated!) to core, so selection 
-     can be made in next */
+  /* fbl-todo: always announce routes staged for selection (updated!) to core, so selection
+     can be made in nest */
   babel_announce_rte(p, e, mod);
 
   /* Shortcut if only non-best was modified */
