@@ -683,6 +683,10 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_ro
 {
   struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
 
+  if (!r) {
+    abort();
+  }
+
   rta a0 = {
     .source = RTS_BABEL,
     .scope = SCOPE_UNIVERSE,
