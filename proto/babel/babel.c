@@ -60,7 +60,8 @@ static inline int gt_mod64k(uint a, uint b)
 
 static void babel_expire_requests(struct babel_proto *p, struct babel_entry *e);
 static void babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_route *mod);
-static inline void babel_announce_retraction(struct babel_proto *p, struct babel_route *r);
+static inline void babel_announce_unreachable(struct babel_proto *p, struct babel_entry *e, short install);
+static inline void babel_announce_retraction(struct babel_proto *p, struct babel_route *r, short install_unreachable);
 static void babel_send_route_request(struct babel_proto *p, struct babel_entry *e, struct babel_neighbor *n);
 static void babel_send_seqno_request(struct babel_proto *p, struct babel_entry *e, struct babel_seqno_request *sr, struct babel_neighbor *n);
 static void babel_update_cost(struct babel_neighbor *n);
@@ -179,9 +180,7 @@ babel_retract_route(struct babel_proto *p, struct babel_route *r)
 {
   r->metric = r->advert_metric = BABEL_INFINITY;
 
-  // fbl-todo: retract from nest, reselection will happen automatically
-  //if (r == r->e->selected)
-  //  babel_select_route(p, r->e, r);
+  babel_announce_retraction(p, r, 0);
 }
 
 static void
@@ -190,7 +189,7 @@ babel_flush_route(struct babel_proto *p UNUSED, struct babel_route *r)
   DBG("Babel: Flush route %N router_id %lR neigh %I\n",
       r->e->n.addr, r->router_id, r->neigh->addr);
 
-  babel_announce_retraction(p, r);
+  babel_announce_retraction(p, r, 1);
 
   rem_node(NODE r);
   rem_node(&r->neigh_route);
@@ -220,9 +219,9 @@ babel_expire_route(struct babel_proto *p, struct babel_route *r)
 static void
 babel_refresh_route(struct babel_proto *p, struct babel_route *r)
 {
-  // fbl-todo: ??
-/*  if (r == r->e->selected)
-    babel_send_route_request(p, r->e, r->neigh);*/
+  // fbl-todo: functional difference: send route request if feasible. not only if selected
+  if (r->in_nest)
+    babel_send_route_request(p, r->e, r->neigh);
 
   r->refresh_time = 0;
 }
@@ -276,6 +275,7 @@ loop:
     if (e->unreachable && (!e->valid || (e->router_id == p->router_id)))
     {
       FIB_ITERATE_PUT(&fit);
+      babel_announce_unreachable(p, e, 0);
       goto loop;
     }
 
@@ -671,19 +671,19 @@ done:
 }
 
 /**
- * babel_announce_rte - announce selected route to the core
+ * babel_announce_rte - announce route source to the core
  * @p: Babel protocol instance
- * @e: Babel route entry to announce
+ * @e: Babel entry to announce
+ * @r: Babel route to announce
  *
- * This function announces a Babel entry to the core if it has a selected
- * incoming path, and retracts it otherwise. If there is no selected route but
- * the entry is valid and ours, the unreachable route is announced instead.
+ * This function announces a Babel route to the core.
  */
 static void
 babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_route *r)
 {
   struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
 
+  // fbl-todo: remove for production
   if (!r) {
     abort();
   }
@@ -739,16 +739,74 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_ro
   rta *a = rta_lookup(&a0);
   rte *rte = rte_get_temp(a, p->p.main_source);
 
-  e->unreachable = 0;
+  r->in_nest = 1;
   rte_update2(c, e->n.addr, rte, a0.src);
+  if (e->unreachable)
+    babel_announce_unreachable(p, e, 0);
 }
 
-/* Special case of babel_announce_rte() just for retraction */
 static inline void
-babel_announce_retraction(struct babel_proto *p, struct babel_route *r)
+babel_announce_unreachable(struct babel_proto *p, struct babel_entry *e, short install)
+{
+  log(L_DEBUG "babel_announce_unreachable");
+  struct channel *c = (e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
+
+  if (install) {
+    rta a0 = {
+      .src = p->p.main_source,
+      .source = RTS_BABEL,
+      .scope = SCOPE_UNIVERSE,
+      .dest = RTD_UNREACHABLE,
+    };
+
+    rta *a = rta_lookup(&a0);
+    rte *rte = rte_get_temp(a);
+    memset(&rte->u.babel, 0, sizeof(rte->u.babel));
+    rte->pflags = 0;
+    rte->pref = 1;
+
+    e->unreachable = 1;
+    rte_update2(c, e->n.addr, rte, p->p.main_source);
+  } else {
+    e->unreachable = 0;
+    rte_update2(c, e->n.addr, NULL, p->p.main_source);
+  }
+}
+
+static inline void
+babel_announce_retraction(struct babel_proto *p, struct babel_route *r, short install_unreachable)
 {
   struct channel *c = (r->e->n.addr->type == NET_IP4) ? p->ip4_channel : p->ip6_channel;
-  r->e->unreachable = 0;
+  struct babel_route *i;
+  short last_route_for_entry = 1;
+
+  if (install_unreachable) {
+   /* Check if this is the last feasible route for this entry */
+    WALK_LIST(i, r->e->routes) {
+      if (i == r) continue;
+      if (i->in_nest) {
+        last_route_for_entry = 0;
+        break;
+      }
+    }
+  } else {
+    // explicit retraction. Do not install unreachable route.
+    last_route_for_entry = 0;
+  }
+
+  if (last_route_for_entry) {
+    /*
+     * We have lost all feasible routes. We have to broadcast seqno request
+     * (Section 3.8.2.1) and keep unreachable route for a while (section 2.8).
+     * The later is done automatically by babel_announce_rte().
+     */
+
+    TRACE(D_EVENTS, "Lost feasible route for prefix %N", r->e->n.addr);
+    if (r->e->valid && (r->router_id == r->e->router_id))
+       babel_add_seqno_request(p, r->e, r->router_id, r->seqno + 1, 0, NULL);
+
+    babel_announce_unreachable(p, r->e, 1);
+  }
 
   struct rte_src *src;
   u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
@@ -756,6 +814,7 @@ babel_announce_retraction(struct babel_proto *p, struct babel_route *r)
   log(L_ERR "retract rte from nest for babel route %N: path-id %R",
       r->e->n.addr, path_id);
 
+  r->in_nest = 0;
   rte_update2(c, r->e->n.addr, NULL, src);
 }
 
@@ -793,28 +852,13 @@ babel_announce_retraction(struct babel_proto *p, struct babel_route *r)
 static void
 babel_select_route(struct babel_proto *p, struct babel_entry *e, struct babel_route *mod)
 {
-  struct babel_route *r;
-
-  // fbl-todo: compute feasibility
-  //  - announce if feasible
-  //  - retract if not feasible
-
-  /* fbl-todo: always announce routes staged for selection (updated!) to core, so selection
-     can be made in nest */
-  babel_announce_rte(p, e, mod);
-
-
-  /* fbl-todo: keep track of feasible routes. if we have lost all feasible routes -> problem! */
-    /*
-     * We have lost all feasible routes. We have to broadcast seqno request
-     * (Section 3.8.2.1) and keep unreachable route for a while (section 2.8).
-     * The later is done automatically by babel_announce_rte().
-     */
-
-    TRACE(D_EVENTS, "Lost feasible route for prefix %N", e->n.addr);
-    /*if (e->valid && (e->selected->router_id == e->router_id))
-      babel_add_seqno_request(p, e, e->selected->router_id, e->selected->seqno + 1, 0, NULL);*/
+  if (mod->metric < BABEL_INFINITY && mod->feasible) {
+    babel_announce_rte(p, e, mod);
+  } else {
+    babel_announce_retraction(p, mod, 1);
+  }
 }
+
 
 /*
  *	Functions to send replies
@@ -1377,10 +1421,13 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
    * (not retransmitted) unicast seqno request to the originator of this update.
    * Note: !feasible -> s exists, check for 's' is just for clarity / safety.
    */
-  if (!feasible && s && (metric != BABEL_INFINITY) /*&&
-      (!best || (r == best) || (metric < best->metric))*/) // fbl-todo: alternative for best, also for next block
+  // fbl-todo: functional difference: send route request if feasible. not only if selected
+  if (!feasible && s && (metric != BABEL_INFINITY) &&
+      (r->in_nest || (metric < e->metric))) // fbl-todo: this will not work if route is not redistributed!
     babel_generate_seqno_request(p, e, s->router_id, s->seqno + 1, nbr);
 
+
+  /*fbl-todo: here! */
   /* Special case - ignore unfeasible update to best route */
   /*if (r == best && !feasible && (msg->router_id == r->router_id))
     return;*/
@@ -2272,7 +2319,6 @@ babel_show_entries_(struct babel_proto *p, struct fib *rtable)
 
   FIB_WALK(rtable, struct babel_entry, e)
   {
-    struct babel_route *r = NULL;
     uint rts = 0, srcs = 0;
     node *n;
 
@@ -2385,8 +2431,6 @@ babel_kick_timer(struct babel_proto *p)
 static int
 babel_preexport(struct channel *C, struct rte *new)
 {
-  struct babel_entry *e;
-
   struct rta *a = new->attrs;
 
   if (new->attrs->nh.iface) {
