@@ -265,6 +265,7 @@ struct babel_route {
   ip_addr next_hop;
   btime refresh_time;
   btime expires;
+  u8 in_nest;
 };
 
 struct babel_seqno_request {
