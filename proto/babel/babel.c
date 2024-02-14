@@ -293,6 +293,31 @@ babel_expire_routes(struct babel_proto *p)
 static inline int seqno_request_valid(struct babel_seqno_request *sr)
 { return !sr->nbr || sr->nbr->ifa; }
 
+static u32
+babel_neighbor_get_id(struct babel_proto *p) {
+  for (size_t i = 0; i < sizeof(p->neighbor_ids) / sizeof(*p->neighbor_ids); i++) {
+    for (size_t j = 0; j < sizeof(*p->neighbor_ids); j++) {
+
+      if (!(p->neighbor_ids[i] >> j & 0x1)) {
+          u32 id = i * sizeof(*p-> neighbor_ids) + j;
+          if (id == 0) continue;
+
+          // found id
+          p->neighbor_ids[i] |= ( 0x1 << j);
+          return id;
+      }
+    }
+  }
+
+  log(L_ERR "neighbor path_id bitmap full!");
+  return 0;
+}
+
+static void
+babel_neighbor_free_id(struct babel_proto *p, u32 id) {
+  p->neighbor_ids[id / sizeof(*p->neighbor_ids)] &= ~( 0x1 << (id % sizeof(*p->neighbor_ids)));
+}
+
 /*
  * Add seqno request to the table of pending requests (RFC 6216 3.2.6) and send
  * it to network. Do nothing if it is already in the table.
@@ -434,6 +459,12 @@ babel_get_neighbor(struct babel_iface *ifa, ip_addr addr)
   nbr->init_expiry = current_time() + BABEL_INITIAL_NEIGHBOR_TIMEOUT;
   init_list(&nbr->routes);
   init_list(&nbr->requests);
+
+  nbr->path_id = babel_neighbor_get_id(p);
+  if (!nbr->path_id) {
+    die("Unable to allocate path_id for neighbor on %s", ifa->iface->name);
+  }
+
   add_tail(&ifa->neigh_list, NODE nbr);
 
   return nbr;
@@ -459,6 +490,8 @@ babel_flush_neighbor(struct babel_proto *p, struct babel_neighbor *nbr)
     babel_remove_seqno_request(p, sr);
 
   nbr->ifa = NULL;
+  babel_neighbor_free_id(p, nbr->path_id);
+  nbr->path_id = 0;
   rem_node(NODE nbr);
   mb_free(nbr);
 }
@@ -661,11 +694,11 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_ro
     a0.nh.flags = RNF_ONLINK;
 
   struct rte_src *src;
-  u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
-  src = rt_get_source(&p->p, path_id);
+  struct babel_neighbor *neigh = r->neigh;
+  src = rt_get_source(&p->p, neigh->path_id);
   a0.src = src;
   log(L_ERR "announce rte to nest for babel route %N: path-id %R metric %I",
-    e->n.addr, path_id, a0.nh.gw);
+    e->n.addr, neigh->path_id, a0.nh.gw);
 
   rta *a = rta_lookup(&a0);
   rte *rte = rte_get_temp(a);
@@ -744,10 +777,10 @@ babel_announce_retraction(struct babel_proto *p, struct babel_route *r, short in
   }
 
   struct rte_src *src;
-  u32 path_id = r->next_hop.addr[3];;// last 32 bits of next_hop addr (fbl-todo: has to be made properly unique, otherwise not unique!)
-  src = rt_get_source(&p->p, path_id);
+  struct babel_neighbor *neigh = r->neigh;
+  src = rt_get_source(&p->p, neigh->path_id);
   log(L_ERR "retract rte from nest for babel route %N: path-id %R",
-      r->e->n.addr, path_id);
+      r->e->n.addr, neigh->path_id);
 
   r->in_nest = 0;
   rte_update2(c, r->e->n.addr, NULL, src);

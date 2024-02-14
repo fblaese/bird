@@ -167,6 +167,8 @@ struct babel_proto {
   u8 update_seqno_inc;			/* Request for update_seqno increase */
   u8 triggered;				/* For triggering global updates */
 
+  long neighbor_ids[4096/sizeof(long)];
+
   slab *route_slab;
   slab *source_slab;
   slab *msg_slab;
@@ -223,6 +225,7 @@ struct babel_neighbor {
   u16 hello_map;
   u16 next_hello_seqno;
   uint last_hello_int;
+  u16 path_id;				/* internal unique neighobr id */
 
   u32 auth_pc;
   u8 auth_passed;
