@@ -120,7 +120,7 @@ babel_convert_to_rte(struct babel_proto *p, struct babel_route *r, int metric, i
  * Read values from rte_route into babel_route.
  */
 void
-babel_convert_from_rte(struct babel_route *babel_route, rte * rte, int * metric) {
+babel_convert_from_rte(rte * rte, int * metric) {
         /* write back metric after filtering */
         // incremented by 41/42 for debugging purposes
         //*metric = *metric < rte->u.babel.metric ? rte->u.babel.metric + 42 : *metric + 41;
@@ -1065,7 +1065,7 @@ babel_send_update_(struct babel_iface *ifa, btime changed, struct fib *rtable)
         /* fbl-todo: explicitly remove route, if currently installed? or await timeout -> unreachable -> uninstall? */
         return;
       } else {
-        babel_convert_from_rte(e->selected, rte, &metric);
+        babel_convert_from_rte(rte, &metric);
       }
     }
 
@@ -1419,7 +1419,7 @@ babel_handle_update(union babel_msg *m, struct babel_iface *ifa)
       /* currently times out -> unreachable -> uninstalled */
       return;
     } else {
-      babel_convert_from_rte(r, rte, &metric);
+      babel_convert_from_rte(rte, &metric);
     }
   }
 
