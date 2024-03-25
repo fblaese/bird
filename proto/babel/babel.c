@@ -765,17 +765,16 @@ babel_announce_rte(struct babel_proto *p, struct babel_entry *e, struct babel_ro
   struct rte_src *src;
   struct babel_neighbor *neigh = r->neigh;
   src = rt_get_source(&p->p, neigh->path_id);
-  a0.src = src;
   log(L_ERR "announce rte to nest for babel route %N: path-id %R metric %I",
     e->n.addr, neigh->path_id, a0.nh.gw);
 
   rta *a = rta_lookup(&a0);
-  rte *rte = rte_get_temp(a, p->p.main_source);
+  rte *rte = rte_get_temp(a, src);
 
   r->in_nest = 1;
-  rte_update2(c, e->n.addr, rte, a0.src);
+  rte_update2(c, e->n.addr, rte, p->p.main_source);
   if (e->unreachable)
-    babel_announce_unreachable(p, e, 0);
+    babel_announce_unreachable(p, e, src);
 }
 
 static inline void
@@ -786,17 +785,15 @@ babel_announce_unreachable(struct babel_proto *p, struct babel_entry *e, short i
 
   if (install) {
     rta a0 = {
-      .src = p->p.main_source,
       .source = RTS_BABEL,
       .scope = SCOPE_UNIVERSE,
       .dest = RTD_UNREACHABLE,
+      .pref = 1,
     };
 
     rta *a = rta_lookup(&a0);
-    rte *rte = rte_get_temp(a);
-    memset(&rte->u.babel, 0, sizeof(rte->u.babel));
+    rte *rte = rte_get_temp(a, p->p.main_source);
     rte->pflags = 0;
-    rte->pref = 1;
 
     e->unreachable = 1;
     rte_update2(c, e->n.addr, rte, p->p.main_source);
